@@ -1,0 +1,22 @@
+/target
+*.gguf
+*.tmp
+.vej/
+
+repomix-output.xml
+
+# Environment & Secrets
+.env
+.env.*
+*.env
+
+# macOS
+.DS_Store
+._*
+
+# Logs
+*.log
+
+# Playground
+playground/node_modules/
+playground/dist/

@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>vej ⚡ System 1 Decision Playground</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./src/styles.css?v=7">
+</head>
+<body>
+  <!-- Top App Navigation -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-logo">vej ⚡</div>
+      <div class="brand-badge">System 1 Playground</div>
+    </div>
+
+    <div class="header-controls">
+      <!-- Target Switcher -->
+      <div class="control-group">
+        <span class="control-label">Target:</span>
+        <select id="target-select" class="control-select">
+          <option value="vej">⚡ Local vej (127.0.0.1:8080)</option>
+          <option value="jev">☁️ TypeSafe AI (api.typesafe.ai)</option>
+          <option value="dual">⚖️ Dual Compare (vej vs Jev)</option>
+        </select>
+      </div>
+
+      <!-- Model Selector -->
+      <div class="control-group">
+        <span class="control-label">Model:</span>
+        <select id="model-select" class="control-select">
+          <option value="llama-3.2-1b">llama-3.2-1b (Fastest • ~10ms)</option>
+          <option value="llama-3.2-3b">llama-3.2-3b (High Accuracy • ~25ms)</option>
+          <option value="llama-3.1-8b">llama-3.1-8b (Frontier Quality • ~60ms)</option>
+          <option value="smollm2-1.7b">smollm2-1.7b (Balanced • ~15ms)</option>
+          <option value="gemma-2-2b">gemma-2-2b (Google • ~25ms)</option>
+          <option value="gemma-2-9b">gemma-2-9b (Google 9B • ~70ms)</option>
+          <option value="gemma-4-e2b">gemma-4-e2b (Google Gemma 4 • ~25ms)</option>
+        </select>
+      </div>
+
+      <!-- API Key Field (Visible for Jev / Dual) -->
+      <div id="api-key-group" class="control-group" style="display: none;">
+        <span class="control-label">Key:</span>
+        <input id="api-key-input" type="password" class="control-input" placeholder="TYPESAFE_API_KEY" style="width: 140px;" />
+      </div>
+
+      <!-- Connection Status Indicator -->
+      <div id="daemon-status" class="status-indicator">
+        <span class="status-dot"></span> Checking daemon...
+      </div>
+    </div>
+  </header>
+
+  <!-- Presets Bar -->
+  <nav class="presets-bar">
+    <div class="control-group">
+      <span class="control-label">Example:</span>
+      <select id="preset-select" class="control-select">
+        <!-- Rendered dynamically -->
+      </select>
+    </div>
+    <button id="reset-preset-btn" class="preset-reset-btn" title="Reset current example to its default state">↺ Reset</button>
+    <span class="preset-divider"></span>
+    <div id="preset-desc" class="preset-desc"></div>
+  </nav>
+
+  <!-- Main Split Pane -->
+  <main class="main-container">
+    <!-- Left Pane: Input State & Questions Configuration -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span>⚙️</span> Decision Configuration
+        </div>
+        <div class="tab-nav">
+          <button class="tab-btn active" data-left-tab="builder">Form Builder</button>
+          <button class="tab-btn" data-left-tab="raw-json">Raw JSON</button>
+        </div>
+      </div>
+
+      <!-- Tab A: Form Builder -->
+      <div class="panel-body" id="builder-view">
+        <!-- Input State -->
+        <div class="field-group">
+          <div class="field-header">
+            <label class="field-label" for="state-input">Input State</label>
+            <div style="display: flex; align-items: center; gap: 0.6rem;">
+              <button class="action-link" id="format-state-btn" style="display: none;">Format JSON</button>
+              <div class="mini-tab-nav" id="state-tab-nav">
+                <button class="mini-tab-btn" data-state-mode="text">Text</button>
+                <button class="mini-tab-btn" data-state-mode="json">JSON</button>
+              </div>
+            </div>
+          </div>
+          <textarea id="state-input" class="text-area" rows="6" placeholder="Enter conversation messages, environment errors, or raw context to evaluate..."></textarea>
+          <div id="state-json-error" class="json-field-error" style="display: none;"></div>
+        </div>
+
+        <!-- Questions & Criteria -->
+        <div class="field-group">
+          <div class="field-header">
+            <label class="field-label">Typed Questions & Primitives</label>
+            <div style="display: flex; align-items: center; gap: 0.6rem;">
+              <button class="action-link" id="add-question-btn">+ Add Question</button>
+              <button class="action-link" id="format-questions-json-btn" style="display: none;">Format JSON</button>
+              <div class="mini-tab-nav" id="questions-tab-nav">
+                <button class="mini-tab-btn active" data-questions-mode="builder">Visual</button>
+                <button class="mini-tab-btn" data-questions-mode="json">JSON</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Mode 1: Visual Builder -->
+          <div id="questions-container" style="display: flex; flex-direction: column; gap: 0.85rem;">
+            <!-- Rendered dynamically -->
+          </div>
+
+          <!-- Mode 2: Questions JSON Editor -->
+          <div id="questions-json-view" style="display: none; flex-direction: column; gap: 0.35rem;">
+            <textarea id="questions-json-editor" class="text-area" rows="10" style="font-family: var(--font-mono); font-size: 0.82rem;" placeholder='{
+  "department": {
+    "type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {
+      "billing": "Payment processing, duplicate charges...",
+      "technical": "System bugs or errors...",
+      "sales": "Pricing tiers or upgrades..."
+    }
+  }
+}'></textarea>
+            <div id="questions-json-error" class="json-field-error" style="display: none;"></div>
+          </div>
+        </div>
+
+        <!-- Temperature Slider -->
+        <div class="field-group">
+          <div class="field-header">
+            <label class="field-label">Temperature: <span id="temp-val" style="color: #60a5fa;">0.8</span></label>
+            <span style="font-size: 0.72rem; color: var(--text-muted);">Lower = more deterministic logits</span>
+          </div>
+          <input type="range" id="temp-slider" min="0.1" max="1.5" step="0.05" value="0.8" style="accent-color: #3b82f6; cursor: pointer;" />
+        </div>
+      </div>
+
+      <!-- Tab B: Raw JSON Editor -->
+      <div class="panel-body" id="raw-json-view" style="display: none;">
+        <div class="field-group" style="flex: 1;">
+          <label class="field-label">Payload JSON (Editable)</label>
+          <textarea id="raw-json-editor" class="text-area" style="flex: 1; min-height: 400px;"></textarea>
+        </div>
+      </div>
+
+      <!-- Bottom Action Footer -->
+      <div class="action-footer">
+        <button id="run-btn" class="run-btn">
+          <span>⚡</span> Run Decision
+        </button>
+        <span class="shortcut-hint">Press <b>⌘ + Enter</b> or <b>Ctrl + Enter</b></span>
+      </div>
+    </section>
+
+    <!-- Right Pane: Results, Visualizations & Code -->
+    <section class="panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span>📊</span> Decision Results
+        </div>
+        <div class="tab-nav">
+          <button class="tab-btn active" data-right-tab="verdict">Verdict</button>
+          <button class="tab-btn" data-right-tab="json">Raw JSON</button>
+          <button class="tab-btn" data-right-tab="code">Code Export</button>
+        </div>
+      </div>
+
+      <!-- Results View -->
+      <div class="panel-body" id="results-container">
+        <!-- Rendered dynamically by app.js -->
+        <div class="empty-state">
+          <div class="empty-icon">🎯</div>
+          <div class="empty-title">Ready for Decision</div>
+          <div class="empty-desc">Hit <b>Run Decision</b> or press <b>⌘+Enter</b> to classify state with restricted softmax inference.</div>
+        </div>
+      </div>
+
+      <!-- Code Export View (Initially hidden) -->
+      <div class="panel-body" id="code-view" style="display: none;">
+        <div class="field-header">
+          <label class="field-label">Ready-to-Use Code Snippet</label>
+          <div class="tab-nav">
+            <button class="tab-btn active" data-code-lang="curl">cURL</button>
+            <button class="tab-btn" data-code-lang="python">Python</button>
+            <button class="tab-btn" data-code-lang="ts">TypeScript</button>
+            <button class="tab-btn" data-code-lang="rust">Rust</button>
+          </div>
+        </div>
+
+        <div class="code-container" style="flex: 1;">
+          <div class="code-header">
+            <span class="code-lang">Executable Command</span>
+            <button class="copy-btn" id="copy-code-btn">Copy</button>
+          </div>
+          <pre class="code-content" id="code-output"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast">Action completed</div>
+
+  <!-- App Script -->
+  <script type="module" src="./src/app.js?v=11"></script>
+
+  <script>
+    // Tab switching for right panel
+    document.querySelectorAll('[data-right-tab]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.rightTab;
+        const resContainer = document.getElementById('results-container');
+        const codeView = document.getElementById('code-view');
+
+        if (tab === 'code') {
+          resContainer.style.display = 'none';
+          codeView.style.display = 'flex';
+        } else {
+          resContainer.style.display = 'flex';
+          codeView.style.display = 'none';
+        }
+      });
+    });
+  </script>
+</body>
+</html>

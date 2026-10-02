@@ -1,0 +1,202 @@
+mod cli;
+mod config;
+mod engine;
+mod models;
+mod server;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli::{Cli, Commands, ConfigCommands, DecideArgs, ModelsCommands, ServeArgs};
+use config::{Config, get_config_path, load_config, save_config};
+use engine::{DecisionEngine, DecisionRequest};
+use models::{RECOMMENDED_MODELS, find_model_spec, get_cache_dir, pull_model, resolve_model_path};
+use std::path::Path;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let cli = Cli::parse();
+    let config = load_config().unwrap_or_default();
+
+    match cli.command {
+        Commands::Serve(args) => handle_serve(args, config).await,
+        Commands::Decide(args) => handle_decide(args, config),
+        Commands::Models(args) => handle_models(args).await,
+        Commands::Config(args) => handle_config(args),
+    }
+}
+
+async fn handle_serve(args: ServeArgs, config: Config) -> Result<()> {
+    let model_query = args
+        .model
+        .as_deref()
+        .unwrap_or(&config.default_model);
+
+    let model_path = resolve_model_path(model_query)
+        .with_context(|| format!("Could not resolve model '{}'", model_query))?;
+
+    let spec = find_model_spec(model_query);
+    let id_str = spec.map(|s| s.id).unwrap_or(model_query).to_string();
+    let tmpl = spec.map(|s| s.template);
+
+    let n_gpu_layers = args.gpu_layers.unwrap_or(config.n_gpu_layers);
+    let threads = args.threads.unwrap_or(config.threads);
+
+    let engine = DecisionEngine::load(
+        &model_path,
+        id_str,
+        tmpl,
+        n_gpu_layers,
+        threads,
+        config.n_ctx,
+    )?;
+
+    server::run_server(engine, config, &args.host, args.port).await?;
+    Ok(())
+}
+
+fn handle_decide(args: DecideArgs, config: Config) -> Result<()> {
+    if args.choices.is_empty() {
+        eprintln!("Error: At least one candidate choice must be provided via -c or --choices (e.g. -c 'refund,support,billing')");
+        std::process::exit(1);
+    }
+
+    let model_query = args
+        .model
+        .as_deref()
+        .unwrap_or(&config.default_model);
+
+    let model_path = resolve_model_path(model_query)
+        .with_context(|| format!("Could not resolve model '{}'", model_query))?;
+
+    let spec = find_model_spec(model_query);
+    let id_str = spec.map(|s| s.id).unwrap_or(model_query).to_string();
+    let tmpl = spec.map(|s| s.template);
+
+    let n_gpu_layers = args.gpu_layers.unwrap_or(config.n_gpu_layers);
+    let threads = args.threads.unwrap_or(config.threads);
+
+    let engine = DecisionEngine::load(
+        &model_path,
+        id_str,
+        tmpl,
+        n_gpu_layers,
+        threads,
+        config.n_ctx,
+    )?;
+
+    use std::io::IsTerminal;
+    let state = if let Some(s) = args.state {
+        s
+    } else if let Some(s) = args.state_pos {
+        s
+    } else if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        buffer.trim().to_string()
+    } else {
+        eprintln!("Error: Input state must be provided either as a positional argument, via --state, or piped into stdin.");
+        std::process::exit(1);
+    };
+
+    if state.trim().is_empty() {
+        eprintln!("Error: Input state cannot be empty.");
+        std::process::exit(1);
+    }
+
+    let req = DecisionRequest {
+        model: Some(model_query.to_string()),
+        state: serde_json::Value::String(state),
+        choices: Some(args.choices),
+        instruction: args.instruction,
+        questions: None,
+        temperature: args.temperature,
+    };
+
+    let res = engine.evaluate_unified(&req)?;
+
+    match res {
+        engine::UnifiedResponse::Flat(flat) => {
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&flat)?);
+            } else {
+                println!("\n⚡ Decision: \x1b[1;32m{}\x1b[0m", flat.decision);
+                println!("🎯 Confidence: \x1b[1;36m{:.2}%\x1b[0m", flat.confidence * 100.0);
+                println!("⏱️  Latency: \x1b[1;33m{:.2} ms\x1b[0m ({} tokens evaluated)", flat.latency_ms, flat.tokens_evaluated);
+                println!("🤖 Model: {}", flat.model);
+                println!("\n📊 Distribution:");
+                let mut sorted_probs: Vec<_> = flat.probabilities.iter().collect();
+                sorted_probs.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+                for (choice, prob) in sorted_probs {
+                    let bar_len = (prob * 30.0).round() as usize;
+                    let bar = "█".repeat(bar_len);
+                    println!("  • {:<16} {:>6.2}% {}", choice, prob * 100.0, bar);
+                }
+            }
+        }
+        engine::UnifiedResponse::Jev(jev) => {
+            println!("{}", serde_json::to_string_pretty(&jev)?);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_models(args: cli::ModelsArgs) -> Result<()> {
+    match args.command {
+        ModelsCommands::List => {
+            println!("\n📦 Supported Models Catalog (US & Allied Nations):\n");
+            println!(
+                "{:<16} {:<24} {:<18} {:<10} {:<12}",
+                "ID", "NAME", "VENDOR (COUNTRY)", "SIZE", "LOCAL STATUS"
+            );
+            println!("{}", "─".repeat(82));
+
+            let cache_dir = get_cache_dir();
+            for m in RECOMMENDED_MODELS {
+                let local_path = cache_dir.join(m.filename);
+                let status = if local_path.exists() {
+                    "\x1b[1;32m✓ Downloaded\x1b[0m"
+                } else {
+                    "\x1b[0;33mAvailable\x1b[0m"
+                };
+                let vendor_country = format!("{} ({})", m.vendor, m.country);
+                println!(
+                    "{:<16} {:<24} {:<18} {:<10} {:<12}",
+                    m.id,
+                    m.name,
+                    vendor_country,
+                    format!("~{:.2} GB", m.size_gb),
+                    status
+                );
+            }
+            println!("\n💡 Tip: Run `vej models pull <id>` to download a model to local cache.");
+            println!("Cache location: {:?}", cache_dir);
+        }
+        ModelsCommands::Pull { model } => {
+            pull_model(&model).await?;
+        }
+    }
+    Ok(())
+}
+
+fn handle_config(args: cli::ConfigArgs) -> Result<()> {
+    match args.command {
+        ConfigCommands::Init { force } => {
+            let path = Path::new("vej.toml");
+            if path.exists() && !force {
+                eprintln!("'vej.toml' already exists. Use --force to overwrite.");
+                return Ok(());
+            }
+            let config = Config::default();
+            save_config(&config, path)?;
+            println!("Created default configuration file: vej.toml");
+        }
+        ConfigCommands::Path => {
+            println!("Config path: {:?}", get_config_path());
+        }
+    }
+    Ok(())
+}
