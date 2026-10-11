@@ -17,6 +17,7 @@ use crate::models::{RECOMMENDED_MODELS, find_model_spec, get_cache_dir, resolve_
 pub struct ServerState {
     pub engine: RwLock<DecisionEngine>,
     pub config: Config,
+    pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Serialize)]
@@ -36,6 +37,16 @@ pub struct SwitchModelRequest {
     pub model: String,
 }
 
+#[derive(Deserialize)]
+pub struct GenerateRequest {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub keep_alive: Option<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 pub struct StatusResponse {
     pub status: &'static str,
@@ -52,17 +63,24 @@ pub async fn run_server(
     host: &str,
     port: u16,
 ) -> Result<()> {
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let state = Arc::new(ServerState {
         engine: RwLock::new(engine),
         config,
+        shutdown_notify: shutdown_notify.clone(),
     });
 
     let playground_dir = std::path::Path::new("playground");
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/systemone", post(decision_handler))
+        .route("/v1/generate", post(generate_handler))
+        .route("/api/generate", post(generate_handler))
+        .route("/api/tags", get(api_tags_handler))
         .route("/v1/models", get(list_models_handler))
         .route("/v1/models/switch", post(switch_model_handler))
+        .route("/v1/shutdown", post(shutdown_handler))
+        .route("/shutdown", post(shutdown_handler))
         .route("/v1/proxy/jev", post(jev_proxy_handler));
 
     if playground_dir.exists() {
@@ -80,16 +98,67 @@ pub async fn run_server(
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("vej Jev-compatible server listening on http://{}", addr);
-    println!("🚀 vej decision daemon running at http://{}", addr);
-    println!("📌 POST /v1/systemone - Evaluate typed decisions");
-    println!("📌 GET  /v1/models    - List configured models");
+    println!("🚀 vej decision & generation daemon running at http://{}", addr);
+    println!("📌 POST /v1/systemone     - Evaluate typed decisions");
+    println!("📌 POST /v1/generate      - Generate text / JSON from active GGUF model");
+    println!("📌 GET  /v1/models        - List configured models");
     println!("📌 POST /v1/models/switch - Hot-switch active model");
+    println!("📌 POST /v1/shutdown      - Gracefully stop the vej daemon");
     if playground_dir.exists() {
         println!("✨ Web Playground    - http://{}/playground", addr);
     }
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_notify.notified().await;
+            tracing::info!("Shutdown requested via HTTP; stopping vej daemon...");
+        })
+        .await?;
     Ok(())
+}
+
+async fn api_tags_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    let engine = state.engine.read().await;
+    let active = engine.current_model().to_string();
+    Json(serde_json::json!({
+        "models": [
+            { "name": active }
+        ]
+    }))
+}
+
+async fn generate_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<GenerateRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if req.prompt.trim().is_empty() {
+        return Ok(Json(serde_json::json!({
+            "response": "",
+            "done": true
+        })));
+    }
+    let engine = state.engine.read().await;
+    let max_tokens = req.max_tokens.unwrap_or(1024);
+    let text = engine
+        .generate_text(&req.prompt, max_tokens)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Generation error: {}", e)))?;
+    Ok(Json(serde_json::json!({
+        "model": engine.current_model(),
+        "response": text,
+        "done": true
+    })))
+}
+
+async fn shutdown_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+    tracing::info!("Received POST /v1/shutdown request");
+    state.shutdown_notify.notify_waiters();
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({
+        "status": "shutting_down"
+    }))
 }
 
 async fn root_handler(

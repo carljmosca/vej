@@ -3,7 +3,8 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel, Special};
+use llama_cpp_2::token::LlamaToken;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -242,7 +243,7 @@ impl DecisionEngine {
                 system_msg, state_str, instr, formatted_options, selection_prompt
             ),
             TemplateStyle::Gemma4 => format!(
-                "<|turn>system\n{}<turn|>\n<|turn>user\nInput State:\n\"\"\"\n{}\n\"\"\"\n\nTask: {}\n\nAvailable Options:{}\n\n{}<turn|>\n<|turn>model\nAnswer: ",
+                "<|turn>system\n{}<turn|>\n<|turn>user\nInput State:\n\"\"\"\n{}\n\"\"\"\n\nTask: {}\n\nAvailable Options:{}\n\n{}<turn|>\n<|turn>model\n<|thought|>\n<thought|>\nAnswer: ",
                 system_msg, state_str, instr, formatted_options, selection_prompt
             ),
         }
@@ -610,5 +611,92 @@ impl DecisionEngine {
                 "Request must provide either 'questions' (Jev format) or 'choices' (flat format)"
             ))
         }
+    }
+
+    pub fn format_generation_prompt(&self, prompt: &str) -> String {
+        let system_msg = "You are a helpful, accurate Bible study assistant. When asked for JSON, respond with valid JSON only.";
+        match self.template {
+            TemplateStyle::Llama3 => format!(
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                system_msg, prompt
+            ),
+            TemplateStyle::ChatML => format!(
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                system_msg, prompt
+            ),
+            TemplateStyle::Gemma => format!(
+                "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n<start_of_turn>model\n",
+                system_msg, prompt
+            ),
+            TemplateStyle::Gemma4 => format!(
+                "<|turn>system\n{}<turn|>\n<|turn>user\n{}<turn|>\n<|turn>model\n<|thought|>\n<thought|>\n",
+                system_msg, prompt
+            ),
+        }
+    }
+
+    pub fn generate_text(&self, user_prompt: &str, max_tokens: usize) -> Result<String> {
+        let formatted = self.format_generation_prompt(user_prompt);
+        let add_bos = match self.template {
+            TemplateStyle::Llama3 | TemplateStyle::ChatML | TemplateStyle::Gemma4 => AddBos::Never,
+            TemplateStyle::Gemma => AddBos::Always,
+        };
+        let prompt_tokens = self
+            .model
+            .str_to_token(&formatted, add_bos)
+            .map_err(|e| anyhow!("Failed to tokenize generation prompt: {:?}", e))?;
+        if prompt_tokens.is_empty() {
+            return Err(anyhow!("Generation prompt tokenized to zero tokens"));
+        }
+
+        let max_gen = max_tokens.clamp(64, 2048);
+        let ctx_size = (prompt_tokens.len() + max_gen + 64).max(self.n_ctx as usize);
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(ctx_size as u32))
+            .with_n_batch(ctx_size as u32)
+            .with_n_threads(self.threads as i32);
+
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| anyhow!("Failed to create generation context: {:?}", e))?;
+
+        let mut batch = LlamaBatch::new(prompt_tokens.len() + 16, 1);
+        batch
+            .add_sequence(&prompt_tokens, 0, false)
+            .map_err(|e| anyhow!("Failed to add prompt sequence: {:?}", e))?;
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow!("Generation prefill decode failed: {:?}", e))?;
+
+        let mut cur_pos = prompt_tokens.len() as i32;
+        let mut output_bytes: Vec<u8> = Vec::new();
+
+        for _ in 0..max_gen {
+            let logits = ctx.get_logits();
+            let mut best_idx = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (idx, &val) in logits.iter().enumerate() {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = idx;
+                }
+            }
+            let next_token = LlamaToken::new(best_idx as i32);
+            if self.model.is_eog_token(next_token) {
+                break;
+            }
+            if let Ok(bytes) = self.model.token_to_bytes(next_token, Special::Plaintext) {
+                output_bytes.extend_from_slice(&bytes);
+            }
+            batch.clear();
+            batch
+                .add(next_token, cur_pos, &[0], true)
+                .map_err(|e| anyhow!("Failed to add generated token to batch: {:?}", e))?;
+            cur_pos += 1;
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow!("Generation step decode failed: {:?}", e))?;
+        }
+
+        Ok(String::from_utf8_lossy(&output_bytes).trim().to_string())
     }
 }
