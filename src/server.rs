@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::config::Config;
-use crate::engine::{DecisionEngine, DecisionRequest};
+use crate::engine::{BatchDecisionRequest, DecisionEngine, DecisionRequest};
 use crate::models::{RECOMMENDED_MODELS, find_model_spec, get_cache_dir, resolve_model_path};
 
 pub struct ServerState {
@@ -74,6 +74,8 @@ pub async fn run_server(
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/systemone", post(decision_handler))
+        .route("/v1/systemone/batch", post(batch_decision_handler))
+        .route("/v1/batch", post(batch_decision_handler))
         .route("/v1/generate", post(generate_handler))
         .route("/api/generate", post(generate_handler))
         .route("/api/tags", get(api_tags_handler))
@@ -99,11 +101,12 @@ pub async fn run_server(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("vej Jev-compatible server listening on http://{}", addr);
     println!("🚀 vej decision & generation daemon running at http://{}", addr);
-    println!("📌 POST /v1/systemone     - Evaluate typed decisions");
-    println!("📌 POST /v1/generate      - Generate text / JSON from active GGUF model");
-    println!("📌 GET  /v1/models        - List configured models");
-    println!("📌 POST /v1/models/switch - Hot-switch active model");
-    println!("📌 POST /v1/shutdown      - Gracefully stop the vej daemon");
+    println!("📌 POST /v1/systemone       - Evaluate typed decisions");
+    println!("📌 POST /v1/systemone/batch - Evaluate batched decisions in a single call");
+    println!("📌 POST /v1/generate        - Generate text / JSON from active GGUF model");
+    println!("📌 GET  /v1/models          - List configured models");
+    println!("📌 POST /v1/models/switch   - Hot-switch active model");
+    println!("📌 POST /v1/shutdown        - Gracefully stop the vej daemon");
     if playground_dir.exists() {
         println!("✨ Web Playground    - http://{}/playground", addr);
     }
@@ -204,7 +207,9 @@ async fn decision_handler(
                         let path = resolve_model_path(spec.id).map_err(|e| {
                             (StatusCode::BAD_REQUEST, format!("Model resolution error: {}", e))
                         })?;
-                        *write_engine = DecisionEngine::load(
+                        let backend = write_engine.backend();
+                        *write_engine = DecisionEngine::load_with_backend(
+                            backend,
                             &path,
                             spec.id.to_string(),
                             Some(spec.template),
@@ -231,6 +236,56 @@ async fn decision_handler(
     let res = engine
         .evaluate_unified(&req)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Evaluation error: {}", e)))?;
+
+    Ok(Json(res))
+}
+
+async fn batch_decision_handler(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<BatchDecisionRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let engine = state.engine.read().await;
+
+    // If request specifies a specific model and it's different from the active one:
+    if let Some(ref req_model) = req.model {
+        if !req_model.eq_ignore_ascii_case(engine.current_model()) {
+            if let Some(spec) = find_model_spec(req_model) {
+                if !spec.id.eq_ignore_ascii_case(engine.current_model()) {
+                    drop(engine);
+                    let mut write_engine = state.engine.write().await;
+                    if !spec.id.eq_ignore_ascii_case(write_engine.current_model()) {
+                        let path = resolve_model_path(spec.id).map_err(|e| {
+                            (StatusCode::BAD_REQUEST, format!("Model resolution error: {}", e))
+                        })?;
+                        let backend = write_engine.backend();
+                        *write_engine = DecisionEngine::load_with_backend(
+                            backend,
+                            &path,
+                            spec.id.to_string(),
+                            Some(spec.template),
+                            state.config.n_gpu_layers,
+                            state.config.threads,
+                            state.config.n_ctx,
+                        )
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("Failed to hot-switch model: {}", e),
+                            )
+                        })?;
+                    }
+                    let res = write_engine.evaluate_batch(&req).map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, format!("Evaluation error: {}", e))
+                    })?;
+                    return Ok(Json(res));
+                }
+            }
+        }
+    }
+
+    let res = engine
+        .evaluate_batch(&req)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Batch evaluation error: {}", e)))?;
 
     Ok(Json(res))
 }
@@ -274,7 +329,9 @@ async fn switch_model_handler(
     let id_str = spec.map(|s| s.id).unwrap_or(model_id).to_string();
     let tmpl = spec.map(|s| s.template);
 
-    *engine = DecisionEngine::load(
+    let backend = engine.backend();
+    *engine = DecisionEngine::load_with_backend(
+        backend,
         &path,
         id_str.clone(),
         tmpl,
