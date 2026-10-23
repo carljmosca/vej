@@ -27,7 +27,7 @@ impl Default for Config {
             .unwrap_or(4);
 
         Self {
-            default_model: "llama-3.2-1b".to_string(),
+            default_model: "gemma-4-e2b".to_string(),
             host: "127.0.0.1".to_string(),
             port: 8080,
             threads,
